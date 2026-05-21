@@ -1,0 +1,301 @@
+name: "OSDO SCA"
+description: "Software Composition Analysis - Scan dependencies for vulnerabilities using OSV-Scanner, Grype, and native package managers"
+author: "OpenSecDevOps"
+
+inputs:
+  path:
+    description: "Path to scan for dependency vulnerabilities"
+    required: false
+    default: "."
+  manifest-file:
+    description: "Dependency manifest file (auto-detect if not specified)"
+    required: false
+    default: ""
+  scanners:
+    description: "Scanners to use (osv, grype, native, all)"
+    required: false
+    default: "osv"
+  severity-threshold:
+    description: "Minimum severity to report (LOW, MEDIUM, HIGH, CRITICAL)"
+    required: false
+    default: "MEDIUM"
+  fail-on-critical:
+    description: "Fail the action if critical vulnerabilities are found"
+    required: false
+    default: "true"
+  fail-on-high:
+    description: "Fail the action if high severity vulnerabilities are found"
+    required: false
+    default: "false"
+  ignore-unfixed:
+    description: "Ignore vulnerabilities without fixes available"
+    required: false
+    default: "false"
+  results-dir:
+    description: "Directory to store results"
+    required: false
+    default: ".osdo/results"
+
+outputs:
+  findings:
+    description: "Total vulnerable dependencies found"
+    value: ${{ steps.aggregate.outputs.total }}
+  critical-count:
+    description: "Critical vulnerabilities count"
+    value: ${{ steps.aggregate.outputs.critical }}
+  high-count:
+    description: "High vulnerabilities count"
+    value: ${{ steps.aggregate.outputs.high }}
+  package-manager:
+    description: "Detected package manager"
+    value: ${{ steps.detect.outputs.package-manager }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Create results directory
+      shell: bash
+      run: |
+        mkdir -p ${{ inputs.results-dir }}/sca
+        echo "Results will be stored in ${{ inputs.results-dir }}/sca"
+
+    - name: Detect Package Manager
+      id: detect
+      shell: bash
+      run: |
+        cd ${{ inputs.path }}
+        pm="unknown"
+        manifest=""
+
+        if [ -f "package-lock.json" ] || [ -f "package.json" ]; then
+          pm="npm"
+          manifest="package-lock.json"
+        elif [ -f "yarn.lock" ]; then
+          pm="yarn"
+          manifest="yarn.lock"
+        elif [ -f "pnpm-lock.yaml" ]; then
+          pm="pnpm"
+          manifest="pnpm-lock.yaml"
+        elif [ -f "requirements.txt" ]; then
+          pm="pip"
+          manifest="requirements.txt"
+        elif [ -f "Pipfile.lock" ]; then
+          pm="pipenv"
+          manifest="Pipfile.lock"
+        elif [ -f "poetry.lock" ]; then
+          pm="poetry"
+          manifest="poetry.lock"
+        elif [ -f "go.sum" ]; then
+          pm="go"
+          manifest="go.sum"
+        elif [ -f "Cargo.lock" ]; then
+          pm="cargo"
+          manifest="Cargo.lock"
+        elif [ -f "pom.xml" ]; then
+          pm="maven"
+          manifest="pom.xml"
+        elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+          pm="gradle"
+          manifest="build.gradle"
+        elif [ -f "Gemfile.lock" ]; then
+          pm="bundler"
+          manifest="Gemfile.lock"
+        elif [ -f "composer.lock" ]; then
+          pm="composer"
+          manifest="composer.lock"
+        fi
+
+        echo "package-manager=$pm" >> $GITHUB_OUTPUT
+        echo "manifest=$manifest" >> $GITHUB_OUTPUT
+        echo "📦 Detected package manager: $pm"
+
+    - name: OSV-Scanner
+      if: contains(inputs.scanners, 'osv') || contains(inputs.scanners, 'all')
+      id: osv
+      shell: bash
+      run: |
+        echo "🔍 Running OSV-Scanner..."
+
+        # Install OSV-Scanner
+        if ! command -v osv-scanner &> /dev/null; then
+          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+        fi
+
+        # Run OSV-Scanner
+        osv-scanner --format json --output ${{ inputs.results-dir }}/sca/osv.json -r ${{ inputs.path }} || true
+
+        # Extract counts
+        total=$(jq '.results[].packages | length' ${{ inputs.results-dir }}/sca/osv.json 2>/dev/null | awk '{s+=$1} END {print s+0}')
+
+        # Count by severity (OSV uses CVSS scores)
+        critical=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity == "CRITICAL" or (.severity[]?.score // 0) >= 9.0)] | length' ${{ inputs.results-dir }}/sca/osv.json 2>/dev/null || echo "0")
+        high=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity == "HIGH" or ((.severity[]?.score // 0) >= 7.0 and (.severity[]?.score // 0) < 9.0))] | length' ${{ inputs.results-dir }}/sca/osv.json 2>/dev/null || echo "0")
+
+        echo "osv-total=$total" >> $GITHUB_OUTPUT
+        echo "osv-critical=$critical" >> $GITHUB_OUTPUT
+        echo "osv-high=$high" >> $GITHUB_OUTPUT
+
+        echo "📊 OSV-Scanner found: $total vulnerable packages ($critical critical, $high high)"
+
+    - name: Grype SCA
+      if: contains(inputs.scanners, 'grype') || contains(inputs.scanners, 'all')
+      id: grype
+      shell: bash
+      run: |
+        echo "🔍 Running Grype for dependency scanning..."
+
+        # Install Grype
+        if ! command -v grype &> /dev/null; then
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+        fi
+
+        # Run Grype on directory
+        grype dir:${{ inputs.path }} \
+          -o json \
+          --file ${{ inputs.results-dir }}/sca/grype.json || true
+
+        # Extract counts
+        critical=$(jq '[.matches[]? | select(.vulnerability.severity == "Critical")] | length' ${{ inputs.results-dir }}/sca/grype.json 2>/dev/null || echo "0")
+        high=$(jq '[.matches[]? | select(.vulnerability.severity == "High")] | length' ${{ inputs.results-dir }}/sca/grype.json 2>/dev/null || echo "0")
+        total=$(jq '.matches | length' ${{ inputs.results-dir }}/sca/grype.json 2>/dev/null || echo "0")
+
+        echo "grype-total=$total" >> $GITHUB_OUTPUT
+        echo "grype-critical=$critical" >> $GITHUB_OUTPUT
+        echo "grype-high=$high" >> $GITHUB_OUTPUT
+
+        echo "📊 Grype found: $total vulnerabilities ($critical critical, $high high)"
+
+    - name: NPM Audit
+      if: (steps.detect.outputs.package-manager == 'npm') && (contains(inputs.scanners, 'native') || contains(inputs.scanners, 'all'))
+      id: npm-audit
+      shell: bash
+      run: |
+        echo "🔍 Running npm audit..."
+        cd ${{ inputs.path }}
+
+        npm audit --json > ${{ inputs.results-dir }}/sca/npm-audit.json 2>/dev/null || true
+
+        # Extract counts
+        critical=$(jq '.metadata.vulnerabilities.critical // 0' ${{ inputs.results-dir }}/sca/npm-audit.json 2>/dev/null || echo "0")
+        high=$(jq '.metadata.vulnerabilities.high // 0' ${{ inputs.results-dir }}/sca/npm-audit.json 2>/dev/null || echo "0")
+        total=$(jq '.metadata.vulnerabilities.total // 0' ${{ inputs.results-dir }}/sca/npm-audit.json 2>/dev/null || echo "0")
+
+        echo "npm-total=$total" >> $GITHUB_OUTPUT
+        echo "npm-critical=$critical" >> $GITHUB_OUTPUT
+        echo "npm-high=$high" >> $GITHUB_OUTPUT
+
+        echo "📊 npm audit found: $total vulnerabilities ($critical critical, $high high)"
+
+    - name: Pip Audit
+      if: (steps.detect.outputs.package-manager == 'pip' || steps.detect.outputs.package-manager == 'pipenv' || steps.detect.outputs.package-manager == 'poetry') && (contains(inputs.scanners, 'native') || contains(inputs.scanners, 'all'))
+      id: pip-audit
+      shell: bash
+      run: |
+        echo "🔍 Running pip-audit..."
+        cd ${{ inputs.path }}
+
+        pip install pip-audit --quiet
+        pip-audit --format json --output ${{ inputs.results-dir }}/sca/pip-audit.json || true
+
+        # Extract counts
+        total=$(jq '. | length' ${{ inputs.results-dir }}/sca/pip-audit.json 2>/dev/null || echo "0")
+
+        echo "pip-total=$total" >> $GITHUB_OUTPUT
+
+        echo "📊 pip-audit found: $total vulnerable packages"
+
+    - name: Go Vulnerability Check
+      if: (steps.detect.outputs.package-manager == 'go') && (contains(inputs.scanners, 'native') || contains(inputs.scanners, 'all'))
+      id: govulncheck
+      shell: bash
+      run: |
+        echo "🔍 Running govulncheck..."
+        cd ${{ inputs.path }}
+
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        govulncheck -json ./... > ${{ inputs.results-dir }}/sca/govulncheck.json 2>/dev/null || true
+
+        echo "📊 govulncheck completed"
+
+    - name: Aggregate Results
+      id: aggregate
+      shell: bash
+      run: |
+        echo "📊 Aggregating SCA results..."
+
+        total=0
+        critical=0
+        high=0
+
+        # Aggregate OSV
+        if [ -f "${{ inputs.results-dir }}/sca/osv.json" ]; then
+          osv_critical=$(jq '[.results[]?.packages[]?.vulnerabilities[]? | select(.database_specific.severity == "CRITICAL")] | length' ${{ inputs.results-dir }}/sca/osv.json 2>/dev/null || echo "0")
+          osv_high=$(jq '[.results[]?.packages[]?.vulnerabilities[]? | select(.database_specific.severity == "HIGH")] | length' ${{ inputs.results-dir }}/sca/osv.json 2>/dev/null || echo "0")
+          critical=$((critical + osv_critical))
+          high=$((high + osv_high))
+        fi
+
+        # Aggregate Grype
+        if [ -f "${{ inputs.results-dir }}/sca/grype.json" ]; then
+          grype_total=$(jq '.matches | length' ${{ inputs.results-dir }}/sca/grype.json 2>/dev/null || echo "0")
+          grype_critical=$(jq '[.matches[]? | select(.vulnerability.severity == "Critical")] | length' ${{ inputs.results-dir }}/sca/grype.json 2>/dev/null || echo "0")
+          grype_high=$(jq '[.matches[]? | select(.vulnerability.severity == "High")] | length' ${{ inputs.results-dir }}/sca/grype.json 2>/dev/null || echo "0")
+          total=$((total + grype_total))
+          # Use max to avoid double-counting across scanners
+          critical=$((critical > grype_critical ? critical : grype_critical))
+          high=$((high > grype_high ? high : grype_high))
+        fi
+
+        # Aggregate npm audit
+        if [ -f "${{ inputs.results-dir }}/sca/npm-audit.json" ]; then
+          npm_total=$(jq '.metadata.vulnerabilities.total // 0' ${{ inputs.results-dir }}/sca/npm-audit.json 2>/dev/null || echo "0")
+          npm_critical=$(jq '.metadata.vulnerabilities.critical // 0' ${{ inputs.results-dir }}/sca/npm-audit.json 2>/dev/null || echo "0")
+          npm_high=$(jq '.metadata.vulnerabilities.high // 0' ${{ inputs.results-dir }}/sca/npm-audit.json 2>/dev/null || echo "0")
+          total=$((total > npm_total ? total : npm_total))
+          critical=$((critical > npm_critical ? critical : npm_critical))
+          high=$((high > npm_high ? high : npm_high))
+        fi
+
+        echo "total=$total" >> $GITHUB_OUTPUT
+        echo "critical=$critical" >> $GITHUB_OUTPUT
+        echo "high=$high" >> $GITHUB_OUTPUT
+
+        echo ""
+        echo "═══════════════════════════════════════"
+        echo "  OSDO SCA Scan Summary"
+        echo "═══════════════════════════════════════"
+        echo "  Path: ${{ inputs.path }}"
+        echo "  Package Manager: ${{ steps.detect.outputs.package-manager }}"
+        echo "  Total Vulnerabilities: $total"
+        echo "  Critical: $critical"
+        echo "  High: $high"
+        echo "═══════════════════════════════════════"
+
+    - name: Check Critical Threshold
+      if: inputs.fail-on-critical == 'true'
+      shell: bash
+      run: |
+        critical=${{ steps.aggregate.outputs.critical }}
+
+        if [ "$critical" -gt 0 ]; then
+          echo "❌ Found $critical critical vulnerabilities"
+          echo "::error::Critical vulnerabilities found in dependencies"
+          exit 1
+        fi
+
+        echo "✅ No critical vulnerabilities found"
+
+    - name: Check High Threshold
+      if: inputs.fail-on-high == 'true'
+      shell: bash
+      run: |
+        high=${{ steps.aggregate.outputs.high }}
+
+        if [ "$high" -gt 0 ]; then
+          echo "❌ Found $high high severity vulnerabilities"
+          echo "::error::High severity vulnerabilities found in dependencies"
+          exit 1
+        fi
+
+        echo "✅ No high severity vulnerabilities found"
